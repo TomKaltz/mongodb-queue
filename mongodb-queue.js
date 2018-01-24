@@ -10,19 +10,12 @@
  *
  **/
 
-var crypto = require('crypto')
-
-// some helper functions
-function id() {
-    return crypto.randomBytes(16).toString('hex')
-}
-
 function now() {
-    return (new Date()).toISOString()
+    return new Date()
 }
 
 function nowPlusSecs(secs) {
-    return (new Date(Date.now() + secs * 1000)).toISOString()
+    return new Date(Date.now() + secs * 1000)
 }
 
 module.exports = function(mongoDbClient, name, opts) {
@@ -40,25 +33,25 @@ function Queue(mongoDbClient, name, opts) {
     opts = opts || {}
 
     this.name = name
+    this.queueId = process.host + process.pid
     this.col = mongoDbClient.collection(name)
-    this.visibility = opts.visibility || 30
+    this.lockDuration = opts.lockDuration || 10
     this.delay = opts.delay || 0
-
-    if ( opts.deadQueue ) {
-        this.deadQueue = opts.deadQueue
-        this.maxRetries = opts.maxRetries || 5
+    this.maxRetries = opts.maxRetries || 5
     }
-}
 
 Queue.prototype.createIndexes = function(callback) {
+    // TODO: probably index on status and visible
+    // TODO: also make a separate index for waiting jobs
     var self = this
 
-    self.col.createIndex({ deleted : 1, visible : 1 }, function(err, indexname) {
+    self.col.createIndex({ status : 1, visible : 1 }, function(err, indexname) {
         if (err) return callback(err)
-        self.col.createIndex({ ack : 1 }, { unique : true, sparse : true }, function(err) {
-            if (err) return callback(err)
-            callback(null, indexname)
-        })
+        callback(indexname)
+        // self.col.createIndex({ ack : 1 }, { unique : true, sparse : true }, function(err) {
+        //     if (err) return callback(err)
+        //     callback(null, indexname)
+        // })
     })
 }
 
@@ -69,31 +62,42 @@ Queue.prototype.add = function(payload, opts, callback) {
         opts = {}
     }
     var delay = opts.delay || self.delay
-    var visible = delay ? nowPlusSecs(delay) : now()
+    var visible = delay ? nowPlusSecs(delay) : new Date()
 
     var msgs = []
     if (payload instanceof Array) {
         if (payload.length === 0) {
-            var errMsg = 'Queue.add(): Array payload length must be greater than 0'
-            return callback(new Error(errMsg))
+            return callback(new Error('Queue.add(): Array payload length must be greater than 0'))
         }
         payload.forEach(function(payload) {
             msgs.push({
-                visible  : visible,
-                payload  : payload,
+                created: new Date(), 
+                status: 'waiting',
+                visible: visible,
+                payload: payload,
+                maxRetries: self.maxRetries,
+                progress: 0,
+                lastFailed: null,
+                lastFailReason: null
             })
         })
     } else {
         msgs.push({
-            visible  : visible,
-            payload  : payload,
+            created: new Date(),
+            status: 'waiting',
+            visible: visible,
+            payload: payload,
+            maxRetries: self.maxRetries,
+            progress: 0,
+            lastFailed: null,
+            lastFailReason: null
         })
     }
 
     self.col.insertMany(msgs, function(err, results) {
         if (err) return callback(err)
         if (payload instanceof Array) return callback(null, '' + results.insertedIds)
-        callback(null, '' + results.ops[0]._id)
+        return callback(null, '' + results.ops[0]._id)
     })
 }
 
@@ -104,19 +108,22 @@ Queue.prototype.get = function(opts, callback) {
         opts = {}
     }
 
-    var visibility = opts.visibility || self.visibility
+    var visibility = opts.lockDuration || self.lockDuration
     var query = {
-        deleted : null,
-        visible : { $lte : now() },
+        status: 'waiting',
+        visible : { $lte : new Date() },
     }
     var sort = {
-        _id : 1
+        _id : 1,
+        // TODO: add priority and sort by priority first
     }
     var update = {
         $inc : { tries : 1 },
         $set : {
-            ack     : id(),
-            visible : nowPlusSecs(visibility),
+            status: 'running',
+            visible: nowPlusSecs(visibility),
+            lastStart: new Date(),
+            worker: self.queueId,
         }
     }
 
@@ -128,93 +135,138 @@ Queue.prototype.get = function(opts, callback) {
         // convert to an external representation
         msg = {
             // convert '_id' to an 'id' string
-            id      : '' + msg._id,
-            ack     : msg.ack,
-            payload : msg.payload,
-            tries   : msg.tries,
+            id: '' + msg._id,
+            created: msg.created,
+            status: msg.status,
+            lockedUntil: msg.visible,
+            payload: msg.payload,
+            tries: msg.tries,
+            maxRetries: msg.maxRetries,
+            progress: msg.progress,
         }
-        // if we have a deadQueue, then check the tries, else don't
-        if ( self.deadQueue ) {
-            // check the tries
-            if ( msg.tries > self.maxRetries ) {
-                // So:
-                // 1) add this message to the deadQueue
-                // 2) ack this message from the regular queue
-                // 3) call ourself to return a new message (if exists)
-                self.deadQueue.add(msg, function(err) {
-                    if (err) return callback(err)
-                    self.ack(msg.ack, function(err) {
-                        if (err) return callback(err)
-                        self.get(callback)
-                    })
-                })
-                return
-            }
-        }
-
         callback(null, msg)
     })
 }
 
-Queue.prototype.ping = function(ack, opts, callback) {
+Queue.prototype.touch = function(id, opts, callback) {
     var self = this
     if ( !callback ) {
         callback = opts
         opts = {}
     }
 
-    var visibility = opts.visibility || self.visibility
+    var visibility = opts.lockDuration || self.lockDuration
     var query = {
-        ack     : ack,
-        visible : { $gt : now() },
-        deleted : null,
+        _id     : id,
+        status: 'running',
+        visible : { $gt : new Date() },
     }
     var update = {
         $set : {
             visible : nowPlusSecs(visibility)
         }
     }
-    self.col.findOneAndUpdate(query, update, { returnOriginal : false }, function(err, msg, blah) {
+    self.col.findOneAndUpdate(query, update, { returnOriginal : false }, function(err, msg) {
         if (err) return callback(err)
         if ( !msg.value ) {
-            return callback(new Error("Queue.ping(): Unidentified ack  : " + ack))
+            return callback(new Error(`Queue.touch(): There is no running job with the id: ${id} or the job has expired.`))
         }
         callback(null, '' + msg.value._id)
     })
 }
 
-Queue.prototype.ack = function(ack, callback) {
+Queue.prototype.progress = function(id, progress, callback) {
+    let self = this
+
+    var query = {
+        _id: id,
+        status: 'running',
+        visible : { $gt : new Date() },
+    }
+    if(progress < 0) progress = 0
+    if(progress > 100) progress = 100
+    var update = {
+        $set : {
+            progress
+        }
+    }
+    self.col.findOneAndUpdate(query, update, { returnOriginal : false }, function(err, msg) {
+        if (err) return callback(err)
+        if ( !msg.value ) {
+            return callback(new Error(`Queue.progress(): There is no running job with the id: ${id} or the job has expired.`))
+        }
+        callback(null, '' + msg.value._id)
+    })
+}
+
+Queue.prototype.done = function(id, callback) {
     var self = this
 
     var query = {
-        ack     : ack,
-        visible : { $gt : now() },
-        deleted : null,
+        _id : id,
+        visible : { $gt : new Date() },
+        status : 'running',
     }
     var update = {
         $set : {
-            deleted : now(),
+            status: 'success',
+            worker: null,
+            progress: 100,
         }
     }
-    self.col.findOneAndUpdate(query, update, { returnOriginal : false }, function(err, msg, blah) {
+    self.col.findOneAndUpdate(query, update, { returnOriginal : false }, function(err, msg) {
         if (err) return callback(err)
         if ( !msg.value ) {
-            return callback(new Error("Queue.ack(): Unidentified ack : " + ack))
+            return callback(new Error(`Queue.done(): There is no job with the id: ${id} or the job has already finished.`))
         }
         callback(null, '' + msg.value._id)
     })
 }
 
-Queue.prototype.clean = function(callback) {
+Queue.prototype.fail = function(id, reason, callback) {
     var self = this
 
     var query = {
-        deleted : { $exists : true },
+        _id : id,
+        visible : { $gt : new Date() },
+        status : 'running',
     }
+    var update = {
+        $set : {
+            worker: null,
+            lastFailed: new Date(),
+            lastFailReason: reason,
+        }
+    }
+    self.col.findOne(query, { returnOriginal : false }, function(err, msg) {
+        if (err) return callback(err)
+        if ( !msg.value ) {
+            return callback(new Error(`Queue.done(): There is no job with the id: ${id} or the job has already finished.`))
+        }
+        if(msg.tries > msg.maxRetires){
+            update.status =  'failed'
+        }else{
+            update.status = 'waiting',
+            update.visible = new Date()
+        }
+        self.col.findOneAndUpdate(query, update, { returnOriginal : false }, function(err, msg) {
+            if (err) return callback(err)
+            if ( !msg.value ) {
+                return callback(new Error(`Queue.done(): There is no job with the id: ${id} or the job has already finished.`))
+            }
+             callback(null, '' + msg.value._id)
+        })
+    })
 
+
+    Queue.prototype.clean = function(callback) {
+    var self = this
+
+    var query = {
+        status : { $not : 'running' },
+    }
     self.col.deleteMany(query, callback)
 }
-
 Queue.prototype.total = function(callback) {
     var self = this
 
@@ -228,7 +280,7 @@ Queue.prototype.size = function(callback) {
     var self = this
 
     var query = {
-        deleted : null,
+        status : 'waiting',
         visible : { $lte : now() },
     }
 
@@ -242,9 +294,7 @@ Queue.prototype.inFlight = function(callback) {
     var self = this
 
     var query = {
-        ack     : { $exists : true },
-        visible : { $gt : now() },
-        deleted : null,
+        status  : 'running',
     }
 
     self.col.count(query, function(err, count) {
@@ -253,11 +303,37 @@ Queue.prototype.inFlight = function(callback) {
     })
 }
 
-Queue.prototype.done = function(callback) {
+Queue.prototype.succeeded = function(callback) {
     var self = this
 
     var query = {
-        deleted : { $exists : true },
+        status : 'success',
+    }
+
+    self.col.count(query, function(err, count) {
+        if (err) return callback(err)
+        callback(null, count)
+    })
+}
+
+Queue.prototype.failed = function(callback) {
+    var self = this
+
+    var query = {
+        status : 'failed',
+    }
+
+    self.col.count(query, function(err, count) {
+        if (err) return callback(err)
+        callback(null, count)
+    })
+}
+
+Queue.prototype.cancelled = function(callback) {
+    var self = this
+
+    var query = {
+        status : 'cancelled',
     }
 
     self.col.count(query, function(err, count) {
