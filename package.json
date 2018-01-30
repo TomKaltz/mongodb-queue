@@ -1,16 +1,23 @@
 {
-  "name": "mongodb-queue",
-  "version": "3.1.0",
-  "description": "Message queues which uses MongoDB.",
-  "main": "mongodb-queue.js",
+  "name": "mongodb-job-queue",
+  "version": "0.1.0",
+  "description": "Job queues based on MongoDB.",
+  "main": "./src/mongodb-queue.js",
   "scripts": {
-    "test": "set -e; for FILE in test/*.js; do node $FILE; done"
+    "test": "./node_modules/.bin/ava ./test/*.test.js --verbose",
+    "cover": " ./node_modules/.bin/nyc ./node_modules/.bin/ava ./test/*.test.js --verbose"
   },
   "dependencies": {},
   "devDependencies": {
-    "tape": "^4.2.2",
+    "ava": "^0.25.0",
+    "eslint": "^4.16.0",
+    "eslint-config-standard": "^11.0.0-beta.0",
+    "eslint-plugin-import": "^2.8.0",
+    "eslint-plugin-node": "^5.2.1",
+    "eslint-plugin-promise": "^3.6.0",
+    "eslint-plugin-standard": "^3.0.1",
     "mongodb": "^2.0.48",
-    "async": "^1.5.0"
+    "nyc": "^11.4.1"
   },
   "homepage": "https://github.com/chilts/mongodb-queue",
   "repository": {
